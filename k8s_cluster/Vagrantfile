@@ -1,0 +1,252 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+# apt-cache madison docker-ce check version
+$docker_version = "5:20.10.8~3-0~ubuntu-focal"
+$k8s_version = "1.22.2"
+$k8s_version_ubuntu = $k8s_version + "-00"
+$local_calibo = true
+
+$timezone = "Asia/Shanghai"
+boxes = [
+  {
+    :img => "ubuntu/focal64",
+    :name => "k8s-master",
+    :ip => "192.168.56.104",
+    :mem => "6324",
+    :cpu => 4,
+    :isMaster => true
+  },
+  {
+    :img => "ubuntu/focal64",
+    :name => "k8s-node1",
+    :ip => "192.168.56.105",
+    :mem => "3072",
+    :cpu => 2,
+    :isMaster => false
+  }
+]
+
+ssh_pub_key = File.readlines("#{Dir.home}/.ssh/id_rsa.pub").first.strip
+
+$iniscript = <<-SHELL
+  mkdir -p /root/.ssh /home/vagrant/.ssh
+  echo -e "LANG=en_US.utf-8\nLC_ALL=en_US.utf-8" >/etc/environment
+  # set timezone
+  timedatectl set-timezone  #{$timezone}
+  # allow ssh from host
+  sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+  systemctl restart sshd
+  echo #{ssh_pub_key} >> /home/vagrant/.ssh/authorized_keys
+  echo #{ssh_pub_key} >> /root/.ssh/authorized_keys                                        
+SHELL
+
+$install_docker = <<-SHELL
+sed -i 's/archive.ubuntu.com/mirrors.ustc.edu.cn/g' /etc/apt/sources.list
+apt-get update
+apt-get -y install \
+  net-tools \
+  apt-transport-https \
+  ca-certificates \
+  curl \
+  gnupg-agent \
+  software-properties-common
+curl -fsSL https://mirrors.ustc.edu.cn/docker-ce/linux/ubuntu/gpg | apt-key add -
+add-apt-repository \
+  "deb [arch=amd64] https://mirrors.ustc.edu.cn/docker-ce/linux/ubuntu \
+  $(lsb_release -cs) \
+  stable"
+echo "deb https://mirrors.ustc.edu.cn/kubernetes/apt kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+curl -s https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | apt-key add
+
+sudo sysctl --system
+    
+apt-get update
+apt-get install -y docker-ce=#{$docker_version} docker-ce-cli=#{$docker_version} containerd.io
+adduser vagrant docker
+
+# ali proxy, and change docker cgroupdriver to systemd !!! must do it
+sudo mkdir -p /etc/docker
+sudo tee /etc/docker/daemon.json <<-'EOF'
+{
+  "registry-mirrors": ["https://zs2ltr6m.mirror.aliyuncs.com"],
+  "exec-opts": ["native.cgroupdriver=systemd"]
+}
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+SHELL
+
+# optional, not tested, use kind to create a cluster
+$install_kind = <<-SHELL
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.11.1/kind-linux-amd64
+chmod +x ./kind
+mv ./kind /usr/local/bin/kind
+SHELL
+
+# install k8s
+$install_k8s = <<-SHELL
+# 将桥接的IPv4/IPv6流量传递到iptables的链
+cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+br_netfilter
+EOF
+
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+EOF
+
+sudo sysctl --system
+
+sudo apt-get update
+sudo apt-get install -y apt-transport-https ca-certificates curl
+
+# 添加GPG 密钥
+sudo curl -s https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | sudo apt-key add -
+
+# 添加 Kubernetes apt 存储库
+sudo tee /etc/apt/sources.list.d/kubernetes.list <<-'EOF'
+deb https://mirrors.aliyun.com/kubernetes/apt kubernetes-xenial main
+EOF
+
+# install kubelet, kubeadm and kubectl
+sudo apt-get update
+sudo apt-get install -y kubelet=#{$k8s_version_ubuntu} kubeadm=#{$k8s_version_ubuntu} kubectl=#{$k8s_version_ubuntu} 
+sudo apt-mark hold kubelet kubeadm kubectl
+
+# alias command
+echo "alias k=kubectl" >> /home/vagrant/.bashrc
+source /home/vagrant/.bashrc
+SHELL
+
+def init_k8s(ip, isMaster, vmname)
+  cidr = ip.split(".")[0..1].join(".") + ".0.0/16"
+  init_k8s = <<-SHELL
+
+  sudo kubeadm init \
+  --image-repository registry.aliyuncs.com/google_containers \
+  --kubernetes-version v#{$k8s_version} \
+  --pod-network-cidr=#{cidr} \
+  --apiserver-advertise-address=#{ip}
+  
+  # vagrant
+  # sudo chown $(id -u):$(id -g) /home/vagrant/.kube/config
+  mkdir -p /home/vagrant/.kube
+  sudo cp -i /etc/kubernetes/admin.conf /home/vagrant/.kube/config
+  sudo chown vagrant:vagrant /home/vagrant/.kube/config
+  # root
+  mkdir -p /root/.kube
+  sudo cp -i /etc/kubernetes/admin.conf /root/.kube/config
+  sudo chown root:root /root/.kube/config
+
+  # check if isMaster add 
+  if [ "#{isMaster}" = "true" ]; then
+    # 去除master节点的污点
+    kubectl taint nodes --all node-role.kubernetes.io/master-
+  else
+    kubectl label nodes #{vmname} node-role.kubernetes.io/master-
+  fi
+
+  # to avoid scheduler error
+  sudo sed -i '/--port=0/  s/^/#/g' /etc/kubernetes/manifests/kube-controller-manager.yaml
+  sudo sed -i '/--port=0/  s/^/#/g' /etc/kubernetes/manifests/kube-scheduler.yaml
+  # if needed
+  systemctl restart kubelet.service
+
+  # check status
+  sudo -u vagrant -i -- sh -c 'kubectl get cs'
+  SHELL
+
+  init_k8s
+end
+
+def install_calico()
+  install_calico = <<-SHELL
+  echo install calico
+  # TODO install calico 国内网络问题 下载公用的
+  # docker pull quay.io/calico/cni:v3.23.5
+  # docker pull quay.io/calico/kube-controllers:v3.23.5
+  # docker pull quay.io/calico/node:v3.23.5
+  # docker pull quay.io/calico/pod2daemon-flexvol:v3.23.5
+  
+  if $local_calibo; then
+    # or isntall locally, if has no local file, don't do it
+    docker load -i /home/vagrant/calibo3.23.5/apiserver.v3.23.5.tar
+    docker load -i /home/vagrant/calibo3.23.5/cni.v3.23.5.tar
+    docker load -i /home/vagrant/calibo3.23.5/kube-controllers.v3.23.5.tar
+    docker load -i /home/vagrant/calibo3.23.5/node.v3.23.5.tar
+    docker load -i /home/vagrant/calibo3.23.5/pod2daemon-flexvol.v3.24.3.tar
+    docker load -i /home/vagrant/calibo3.23.5/typha.v3.23.5.tar
+
+    # retag
+    docker tag quay.io/calico/typha:v3.23.5 docker.io/calico/typha:v3.23.5
+    docker tag quay.io/calico/kube-controllers:v3.23.5 docker.io/calico/kube-controllers:v3.23.5
+    docker tag quay.io/calico/apiserver:v3.23.5 docker.io/calico/apiserver:v3.23.5
+    docker tag quay.io/calico/cni:v3.23.5 docker.io/calico/cni:v3.23.5
+    docker tag quay.io/calico/node:v3.23.5 docker.io/calico/node:v3.23.5
+    docker tag quay.io/calico/pod2daemon-flexvol:v3.24.5 docker.io/calico/pod2daemon-flexvol:v3.24.3
+
+    # install calico
+    kubectl create -f https://projectcalico.docs.tigera.io/archive/v3.23/manifests/tigera-operator.yaml
+    kubectl create -f https://projectcalico.docs.tigera.io/archive/v3.23/manifests/custom-resources.yaml
+  fi
+  SHELL
+
+  install_calico
+end
+
+Vagrant.configure(2) do |config|
+  boxes.each do |vms|
+    config.vm.define vms[:name] do |config|
+      # Define VM base configuration
+      config.vm.box = vms[:img]
+      config.vm.network "private_network", ip: vms[:ip]
+      config.vm.hostname = vms[:name]
+      if vms[:isMaster]
+        config.vm.synced_folder "./calibo3.23.5", "/home/vagrant/calibo3.23.5", type: "rsync"
+      end
+      config.vm.synced_folder "./test", "/home/vagrant/test", type: "rsync"
+      config.vm.provision "file", source: "./join_master.sh", destination: "/home/vagrant/join_master.sh"
+      
+      # Provision VM with shell scripts
+      config.vm.provision "shell", inline: $iniscript
+      config.vm.provision "shell", inline: $install_docker
+      config.vm.provision "shell", inline: $install_k8s
+
+      if vms[:isMaster]
+        config.vm.provision "shell", inline: init_k8s(vms[:ip], vms[:isMaster], vms[:name])
+
+        # write join master script
+        config.vm.provision "shell", inline: "sudo kubeadm token create --print-join-command > /home/vagrant/join_master.sh"     
+
+        config.vm.provision "shell", inline: install_calico()
+
+        config.trigger.after :up do |trigger|
+          # copy join master script to host
+          trigger.run = {
+            inline: <<-SHELL
+                scp -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -i .vagrant/machines/#{vms[:name]}/virtualbox/private_key \
+                vagrant@#{vms[:ip]}:/home/vagrant/join_master.sh \
+                ./join_master.sh
+            SHELL
+          }
+        end
+      else
+        # join master
+        config.vm.provision "shell", inline: "sh /home/vagrant/join_master.sh"
+      end
+
+      # Uncomment and configure these lines as needed
+      # config.vm.synced_folder "/Users/sam-tech/dockerdata", "/home/vagrant/dockerdata"
+      # config.vm.synced_folder "/Users/sam-tech/devops/setup_vm/docker_init-tool", "/home/vagrant/docker_init-tool"
+      # pending vagrant plugin install vagrant-disksize
+      # config.vagrant.plugins = "vagrant-disksize"
+      # config.disksize.size = '10GB'
+      config.vm.provider "virtualbox" do |v|
+        v.memory = vms[:mem]
+        v.cpus = vms[:cpu]
+      end
+    end
+  end
+end
