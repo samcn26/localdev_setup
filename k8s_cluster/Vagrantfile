@@ -168,7 +168,7 @@ def install_calico()
   # docker pull quay.io/calico/node:v3.23.5
   # docker pull quay.io/calico/pod2daemon-flexvol:v3.23.5
   
-  if $local_calibo; then
+  if [ $local_calibo = "true" ]; then
     # or isntall locally, if has no local file, don't do it
     docker load -i /home/vagrant/calibo3.23.5/apiserver.v3.23.5.tar
     docker load -i /home/vagrant/calibo3.23.5/cni.v3.23.5.tar
